@@ -85,24 +85,75 @@ class Mono16ToMono8Converter(Node):
         return ((image - img_min) * 255.0 / (img_max - img_min)).astype(np.uint8)
 
     def process_image(self, image):
-        """Process mono16 image with enhanced contrast"""
+        """Process mono16 image with enhanced contrast while preserving details"""
         try:
-            # Step 1: Intensity Binding (clip to meaningful percentiles)
-            bound_img = self.intensity_binding(image)
+            # Step 1: Calculate histogram for dynamic range adaptation
+            hist, bins = np.histogram(image.flatten(), 256, [0, 65535])
+            cdf = hist.cumsum()
             
-            # Step 2: Convert to 8-bit with full dynamic range
-            img_8bit = self.normalize_to_uint8(bound_img)
+            # Find meaningful percentiles for dynamic range adaptation
+            if cdf[-1] > 0:  # Avoid division by zero
+                cdf_normalized = cdf * 65535 / cdf[-1]
+                
+                # Adaptive percentile selection based on image characteristics
+                # Analyze thermal distribution to select optimal percentiles
+                img_std = np.std(image)
+                
+                # For higher contrast scenes, use tighter bounds to avoid saturation
+                min_percentile = 0.02  # Start with 2% percentile
+                max_percentile = 0.98  # Start with 98% percentile
+                
+                # Adjust percentiles based on image statistics
+                if img_std > 5000:  # High variance/contrast scene
+                    min_percentile = 0.05
+                    max_percentile = 0.95
+                elif img_std < 1000:  # Low variance/contrast scene
+                    min_percentile = 0.01
+                    max_percentile = 0.99
+                
+                # Get intensity values at these percentiles
+                lower_val = np.searchsorted(cdf_normalized, min_percentile * 65535)
+                upper_val = np.searchsorted(cdf_normalized, max_percentile * 65535)
+                
+                # Ensure we have a reasonable range
+                if upper_val <= lower_val:
+                    upper_val = lower_val + 1
+            else:
+                # Fallback to simple min/max
+                lower_val = np.min(image)
+                upper_val = np.max(image)
+                if upper_val <= lower_val:
+                    upper_val = lower_val + 1
             
-            # Step 3: Apply CLAHE for local contrast enhancement
+            # Step 2: Apply dynamic range adaptation
+            adapted_img = np.clip((image - lower_val) * 65535 / (upper_val - lower_val), 0, 65535).astype(np.uint16)
+            
+            # Step 3: Convert to 8-bit
+            img_8bit = (adapted_img / 256).astype(np.uint8)
+            
+            # Step 4: Apply CLAHE for local contrast enhancement
             clahe_img = self.clahe.apply(img_8bit)
             
-            # Step 4: Apply bilateral filter to reduce noise while preserving edges
-            final_img = cv2.bilateralFilter(
-                clahe_img, 
-                self.bilateral_d,
-                self.bilateral_sigma_color,
-                self.bilateral_sigma_space
+            # Step 5: Apply a combination of filters to preserve edges while reducing noise
+            # First, apply a small Gaussian blur to reduce noise
+            blurred = cv2.GaussianBlur(clahe_img, (3, 3), 0)
+            
+            # Then apply a mild bilateral filter with carefully tuned parameters
+            # This will preserve edges better than the previous implementation
+            # Lower d (diameter) and appropriate sigma values prevent excessive blurring
+            bilateral = cv2.bilateralFilter(
+                blurred, 
+                d=5,  # Smaller neighborhood
+                sigmaColor=25,  # Reduced from 75
+                sigmaSpace=5    # Reduced from 75
             )
+            
+            # Step 6: Apply unsharp masking to enhance edges
+            # Create a Gaussian blurred version for the mask
+            gaussian = cv2.GaussianBlur(bilateral, (5, 5), 1.0)
+            # Apply unsharp mask (enhance edges by subtracting blurred image)
+            unsharp_amount = 0.6  # Controls the enhancement intensity (0.5-1.5 is typical)
+            final_img = cv2.addWeighted(bilateral, 1 + unsharp_amount, gaussian, -unsharp_amount, 0)
             
             return final_img
             
