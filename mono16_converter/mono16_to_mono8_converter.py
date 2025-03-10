@@ -85,38 +85,77 @@ class Mono16ToMono8Converter(Node):
         return ((image - img_min) * 255.0 / (img_max - img_min)).astype(np.uint8)
 
     def process_image(self, image):
-        """Process mono16 image with enhanced contrast focused on human recognition"""
+        """Process mono16 image with enhanced contrast focused on human thermal signature"""
         try:
-            # Step 1: Apply more aggressive dynamic range optimization
-            # Find meaningful percentiles for robust contrast stretching
-            p_low = np.percentile(image, 1)  # 1st percentile
-            p_high = np.percentile(image, 99)  # 99th percentile
+            # Step 1: Thermal calibration - identify human temperature range
+            # Typical human temperatures in thermal imagery fall in a specific range
+            # We'll enhance this range specifically to make humans stand out
             
-            # Ensure we have a valid range
-            if p_high <= p_low:
-                p_high = p_low + 1
+            # First, get overall image statistics
+            img_min = np.min(image)
+            img_max = np.max(image)
+            img_range = img_max - img_min
             
-            # Apply contrast stretching to utilize full 8-bit range
-            adapted = np.clip((image - p_low) * 255.0 / (p_high - p_low), 0, 255).astype(np.uint8)
+            # Analyze histogram to identify potential human regions
+            hist, bins = np.histogram(image.flatten(), 256, [img_min, img_max])
             
-            # Step 2: Apply stronger CLAHE for better local contrast
-            # This helps distinguish humans from backgrounds
-            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-            clahe_img = clahe.apply(adapted)
+            # Human body typically appears as warmer regions (higher values)
+            # in thermal imaging, often in the upper 30-40% of the range
+            # Let's identify this region and enhance it
             
-            # Step 3: Apply customized sharpening specifically tuned for human features
-            # Create kernel for edge detection - focusing on human-sized features
-            kernel_sharpen = np.array([[-1, -1, -1],
-                                       [-1, 9, -1],
-                                       [-1, -1, -1]])
+            # Find the temperature threshold that might represent human body
+            # This is typically in the upper temperature range but not at the very top
+            human_temp_lower = img_min + img_range * 0.6  # Approximate lower bound for human temps
+            human_temp_upper = img_min + img_range * 0.9  # Approximate upper bound for human temps
             
-            # Apply sharpening filter - enhances edges significantly
-            sharpened = cv2.filter2D(clahe_img, -1, kernel_sharpen)
+            # Create a custom grayscale mapping function that:
+            # 1. Preserves overall scene context with basic contrast
+            # 2. Gives the human temperature range maximum contrast
             
-            # Step 4: Apply very minimal noise reduction that preserves critical details
-            # Use a conservative median filter with small kernel size
-            # This removes speckle noise without blurring edges
-            final_img = cv2.medianBlur(sharpened, 3)
+            # Create output image with basic contrast stretching first
+            output = np.zeros_like(image, dtype=np.uint8)
+            
+            # Basic contrast stretch to use full 0-255 range
+            # but reserve the 100-220 range for human temperatures to create distinction
+            mask_below_human = image < human_temp_lower
+            mask_human = (image >= human_temp_lower) & (image <= human_temp_upper)
+            mask_above_human = image > human_temp_upper
+            
+            # Map temperatures below human range to 0-100
+            if np.any(mask_below_human):
+                below_min = np.min(image[mask_below_human])
+                below_max = human_temp_lower
+                if below_max > below_min:
+                    output[mask_below_human] = ((image[mask_below_human] - below_min) * 100.0 / 
+                                               (below_max - below_min)).astype(np.uint8)
+            
+            # Map human temperature range to 100-220 (distinct middle gray)
+            # This creates maximum contrast with background
+            if np.any(mask_human):
+                human_min = human_temp_lower
+                human_max = human_temp_upper
+                if human_max > human_min:
+                    output[mask_human] = 100 + ((image[mask_human] - human_min) * 120.0 / 
+                                               (human_max - human_min)).astype(np.uint8)
+            
+            # Map temperatures above human range to 220-255
+            if np.any(mask_above_human):
+                above_min = human_temp_upper
+                above_max = np.max(image[mask_above_human])
+                if above_max > above_min:
+                    output[mask_above_human] = 220 + ((image[mask_above_human] - above_min) * 35.0 / 
+                                                     (above_max - above_min)).astype(np.uint8)
+            
+            # Apply gentle edge enhancement
+            kernel_sharpen = np.array([[-0.5, -0.5, -0.5],
+                                       [-0.5,  5.0, -0.5],
+                                       [-0.5, -0.5, -0.5]])
+            
+            sharpened = cv2.filter2D(output, -1, kernel_sharpen)
+            
+            # Apply a conservative noise reduction
+            # Bilateral filter preserves edges while reducing noise
+            final_img = cv2.bilateralFilter(sharpened, 5, 25, 5)
             
             return final_img
             
