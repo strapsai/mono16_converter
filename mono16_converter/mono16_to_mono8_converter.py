@@ -85,39 +85,38 @@ class Mono16ToMono8Converter(Node):
         return ((image - img_min) * 255.0 / (img_max - img_min)).astype(np.uint8)
 
     def process_image(self, image):
-        """Process mono16 image with enhanced contrast"""
+        """Process mono16 image with enhanced contrast focused on human recognition"""
         try:
-            # Convert to float for better precision in calculations
-            img_float = image.astype(np.float32)
-            
-            # Simple auto-scaling based on min/max with a small margin
-            # This ensures we don't lose too much detail in dark areas
-            p_low = np.percentile(img_float, 1)  # Use 1st percentile instead of min
-            p_high = np.percentile(img_float, 99)  # Use 99th percentile instead of max
-            
-            # Expand the range slightly to avoid clipping important details
-            margin = (p_high - p_low) * 0.05
-            p_low = max(0, p_low - margin)
-            p_high = min(65535, p_high + margin)
+            # Step 1: Apply more aggressive dynamic range optimization
+            # Find meaningful percentiles for robust contrast stretching
+            p_low = np.percentile(image, 1)  # 1st percentile
+            p_high = np.percentile(image, 99)  # 99th percentile
             
             # Ensure we have a valid range
             if p_high <= p_low:
                 p_high = p_low + 1
             
-            # Normalize to 0-255 range with better precision using float calculations
-            normalized = np.clip((img_float - p_low) * 255.0 / (p_high - p_low), 0, 255).astype(np.uint8)
+            # Apply contrast stretching to utilize full 8-bit range
+            adapted = np.clip((image - p_low) * 255.0 / (p_high - p_low), 0, 255).astype(np.uint8)
             
-            # Apply mild CLAHE for local contrast enhancement without overprocessing
-            clahe_img = self.clahe.apply(normalized)
+            # Step 2: Apply stronger CLAHE for better local contrast
+            # This helps distinguish humans from backgrounds
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+            clahe_img = clahe.apply(adapted)
             
-            # Very light noise reduction that preserves details
-            # Use a small bilateral filter with carefully chosen parameters
-            final_img = cv2.bilateralFilter(
-                clahe_img,
-                d=3,            # Small diameter
-                sigmaColor=15,  # Conservative color filtering
-                sigmaSpace=3    # Small spatial extent
-            )
+            # Step 3: Apply customized sharpening specifically tuned for human features
+            # Create kernel for edge detection - focusing on human-sized features
+            kernel_sharpen = np.array([[-1, -1, -1],
+                                       [-1, 9, -1],
+                                       [-1, -1, -1]])
+            
+            # Apply sharpening filter - enhances edges significantly
+            sharpened = cv2.filter2D(clahe_img, -1, kernel_sharpen)
+            
+            # Step 4: Apply very minimal noise reduction that preserves critical details
+            # Use a conservative median filter with small kernel size
+            # This removes speckle noise without blurring edges
+            final_img = cv2.medianBlur(sharpened, 3)
             
             return final_img
             
