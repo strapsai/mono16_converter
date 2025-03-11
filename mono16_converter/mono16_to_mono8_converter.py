@@ -215,21 +215,61 @@ class Mono16ToMono8Converter(Node):
             gaussian = cv2.GaussianBlur(enhanced_img, (0, 0), 3)
             detail = cv2.subtract(enhanced_img, gaussian)
             
-            # Apply extreme enhancement to important features - Method 4 from our test
+            # Apply extreme enhancement to important features - DIAGNOSTIC POINT 1
             detail_enhanced = np.copy(detail)
             
-            # Method 4: Pre-compute enhanced versions
-            strong_detail = cv2.multiply(detail.astype(np.float32), 3.5).astype(np.uint8)
-            mild_detail = cv2.multiply(detail.astype(np.float32), 1.5).astype(np.uint8)
+            # Print diagnostic information
+            self.get_logger().info(f"DIAGNOSTIC - Detail shape: {detail.shape}")
+            self.get_logger().info(f"DIAGNOSTIC - Feature mask shape: {feature_mask.shape}")
+            self.get_logger().info(f"DIAGNOSTIC - Feature mask dtype: {feature_mask.dtype}")
+            self.get_logger().info(f"DIAGNOSTIC - Detail[feature_mask] shape: {detail[feature_mask].shape}")
             
-            # Apply the appropriate enhancement using the mask
-            detail_enhanced[feature_mask] = strong_detail[feature_mask]
-            detail_enhanced[~feature_mask] = mild_detail[~feature_mask]
+            # Print the result of cv2.multiply
+            try:
+                strong_enhanced = cv2.multiply(detail[feature_mask], 3.5)
+                self.get_logger().info(f"DIAGNOSTIC - Strong enhancement shape: {strong_enhanced.shape}")
+                self.get_logger().info(f"DIAGNOSTIC - Strong enhancement dtype: {strong_enhanced.dtype}")
+            except Exception as e:
+                self.get_logger().info(f"DIAGNOSTIC - multiply error: {str(e)}")
+            
+            # Try alternate approaches to understand the issue
+            try:
+                # Method 1: Using direct multiplication
+                enhanced_1 = detail[feature_mask] * 3.5
+                self.get_logger().info(f"DIAGNOSTIC - Method 1 shape: {enhanced_1.shape}, dtype: {enhanced_1.dtype}")
+                
+                # Method 2: First multiply, then index
+                full_enhanced = cv2.multiply(detail.astype(np.float32), 3.5)
+                enhanced_2 = full_enhanced[feature_mask]
+                self.get_logger().info(f"DIAGNOSTIC - Method 2 shape: {enhanced_2.shape}, dtype: {enhanced_2.dtype}")
+                
+                # Method 3: Using np.where
+                enhanced_3 = np.where(feature_mask, detail * 3.5, detail)
+                self.get_logger().info(f"DIAGNOSTIC - Method 3 shape: {enhanced_3.shape}, dtype: {enhanced_3.dtype}")
+            except Exception as e:
+                self.get_logger().info(f"DIAGNOSTIC - alternative method error: {str(e)}")
+                
+            # Let's try the original code but with extra diagnostics
+            try:
+                detail_enhanced[feature_mask] = cv2.multiply(detail[feature_mask], 3.5)
+                self.get_logger().info("DIAGNOSTIC - First assignment succeeded!")
+            except Exception as e:
+                self.get_logger().info(f"DIAGNOSTIC - First assignment error: {str(e)}")
+                
+            try:
+                detail_enhanced[~feature_mask] = cv2.multiply(detail[~feature_mask], 1.5)
+                self.get_logger().info("DIAGNOSTIC - Second assignment succeeded!")
+            except Exception as e:
+                self.get_logger().info(f"DIAGNOSTIC - Second assignment error: {str(e)}")
+            
+            # Use the original code for now, as it produced the best results
+            detail_enhanced[feature_mask] = cv2.multiply(detail[feature_mask], 3.5)
+            detail_enhanced[~feature_mask] = cv2.multiply(detail[~feature_mask], 1.5)
             
             # Recombine
-            recombined = cv2.add(gaussian, detail_enhanced)
+            recombined = cv2.add(gaussian, detail_enhanced.astype(np.uint8))
             
-            # Step 6: Final extreme sharpening for important features
+            # Step 6: Final extreme sharpening for important features - DIAGNOSTIC POINT 2
             blur = cv2.GaussianBlur(recombined, (0, 0), 2)
             
             # Create extreme sharpening mask - combine feature mask with edge detection
@@ -237,30 +277,74 @@ class Mono16ToMono8Converter(Node):
             edges_dilated = cv2.dilate(edges, kernel, iterations=1)
             extreme_mask = np.logical_or(feature_mask, edges_dilated > 0)
             
+            # Print diagnostic information for the unsharp masking
+            self.get_logger().info(f"DIAGNOSTIC - Extreme mask shape: {extreme_mask.shape}")
+            self.get_logger().info(f"DIAGNOSTIC - Recombined shape: {recombined.shape}")
+            self.get_logger().info(f"DIAGNOSTIC - Blur shape: {blur.shape}")
+            self.get_logger().info(f"DIAGNOSTIC - Recombined[extreme_mask] shape: {recombined[extreme_mask].shape}")
+            
             # Create final image
             final_img = np.copy(recombined)
             
-            # Method 4: Pre-compute sharpened versions
-            extreme_sharp = cv2.addWeighted(recombined, 1 + 2.5, blur, -2.5, 0)
-            moderate_sharp = cv2.addWeighted(recombined, 1 + 0.8, blur, -0.8, 0)
+            # Let's try the original code with diagnostics
+            try:
+                final_img[extreme_mask] = cv2.addWeighted(
+                    recombined[extreme_mask], 1 + 2.5,
+                    blur[extreme_mask], -2.5, 0
+                )
+                self.get_logger().info("DIAGNOSTIC - First unsharp masking succeeded!")
+            except Exception as e:
+                self.get_logger().info(f"DIAGNOSTIC - First unsharp masking error: {str(e)}")
+                
+            try:
+                final_img[~extreme_mask] = cv2.addWeighted(
+                    recombined[~extreme_mask], 1 + 0.8,
+                    blur[~extreme_mask], -0.8, 0
+                )
+                self.get_logger().info("DIAGNOSTIC - Second unsharp masking succeeded!")
+            except Exception as e:
+                self.get_logger().info(f"DIAGNOSTIC - Second unsharp masking error: {str(e)}")
             
-            # Apply the appropriate sharpening using the mask
-            final_img[extreme_mask] = extreme_sharp[extreme_mask]
-            final_img[~extreme_mask] = moderate_sharp[~extreme_mask]
+            # Use the original code for now
+            final_img[extreme_mask] = cv2.addWeighted(
+                recombined[extreme_mask], 1 + 2.5,
+                blur[extreme_mask], -2.5, 0
+            )
+            final_img[~extreme_mask] = cv2.addWeighted(
+                recombined[~extreme_mask], 1 + 0.8,
+                blur[~extreme_mask], -0.8, 0
+            )
             
             # Final very mild denoise to clean up any introduced noise
-            # But avoid smoothing the enhanced features
+            # But avoid smoothing the enhanced features - DIAGNOSTIC POINT 3
             weight_map = np.ones_like(final_img, dtype=np.float32)
             weight_map[extreme_mask] = 0.2  # Apply minimal filtering to important features
             weight_map[~extreme_mask] = 0.8  # Apply more filtering to other areas
             
+            # Print diagnostic information for the final weighting
+            self.get_logger().info(f"DIAGNOSTIC - Weight map shape: {weight_map.shape}")
+            self.get_logger().info(f"DIAGNOSTIC - Weight map dtype: {weight_map.dtype}")
+            self.get_logger().info(f"DIAGNOSTIC - Final img shape: {final_img.shape}")
+            self.get_logger().info(f"DIAGNOSTIC - Filtered shape: {filtered.shape}")
+            
             # Bilateral filter with very small diameter
             filtered = cv2.bilateralFilter(final_img, d=3, sigmaColor=15, sigmaSpace=5)
             
-            # For the final weighted blend, we need a different approach
-            inv_weight_map = 1.0 - weight_map
-            result = (final_img.astype(np.float32) * inv_weight_map + 
-                    filtered.astype(np.float32) * weight_map).astype(np.uint8)
+            # Try original code with diagnostics
+            try:
+                result = cv2.addWeighted(
+                    final_img, 1.0 - weight_map,
+                    filtered, weight_map, 0
+                )
+                self.get_logger().info("DIAGNOSTIC - Final weighting succeeded!")
+            except Exception as e:
+                self.get_logger().info(f"DIAGNOSTIC - Final weighting error: {str(e)}")
+                
+            # Use original code
+            result = cv2.addWeighted(
+                final_img, 1.0 - weight_map,
+                filtered, weight_map, 0
+            )
             
             return result
             
