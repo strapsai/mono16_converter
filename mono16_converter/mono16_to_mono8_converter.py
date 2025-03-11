@@ -21,7 +21,7 @@ class Mono16ToMono8Converter(Node):
             try:
                 import subprocess
                 import sys
-                subprocess.check_call([sys.executable, "-m", "pip", "install", "pywavelets"])
+                # subprocess.check_call([sys.executable, "-m", "pip", "install", "pywavelets"])
                 import pywt
                 self.pywt = pywt
                 self.pywt_imported = True
