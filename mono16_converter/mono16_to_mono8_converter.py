@@ -10,6 +10,26 @@ class Mono16ToMono8Converter(Node):
         super().__init__('mono16_to_mono8_converter')
         self.get_logger().info('Starting Enhanced Mono16 to Mono8 Converter')
         
+        # Try importing PyWavelets, install if not available
+        try:
+            import pywt
+            self.pywt = pywt
+            self.pywt_imported = True
+            self.get_logger().info("PyWavelets successfully imported")
+        except ImportError:
+            self.get_logger().info("PyWavelets not found, attempting to install...")
+            try:
+                import subprocess
+                import sys
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "pywavelets"])
+                import pywt
+                self.pywt = pywt
+                self.pywt_imported = True
+                self.get_logger().info("PyWavelets successfully installed and imported")
+            except Exception as e:
+                self.get_logger().warn(f"Could not install PyWavelets: {str(e)}. Proceeding without wavelet denoising.")
+                self.pywt_imported = False
+        
         # Initialize parameters
         self.declare_parameter('clahe_clip_limit', 2.0)
         self.declare_parameter('clahe_grid_size_x', 8)
@@ -19,7 +39,8 @@ class Mono16ToMono8Converter(Node):
         self.declare_parameter('bilateral_sigma_space', 75)
         self.declare_parameter('input_topic', 'image_raw')
         self.declare_parameter('output_topic', 'image_raw/mono8')
-        self.declare_parameter('target_fps', 2.0)
+        self.declare_parameter('target_fps', 10.0)
+        self.declare_parameter('target_image_encoding', 'INFERNO')
         
         # Get parameters
         clahe_clip_limit = self.get_parameter('clahe_clip_limit').value
@@ -85,79 +106,170 @@ class Mono16ToMono8Converter(Node):
         return ((image - img_min) * 255.0 / (img_max - img_min)).astype(np.uint8)
 
     def process_image(self, image):
-        """Process mono16 image with enhanced contrast focused on human thermal signature"""
+        """Enhanced thermal processing with extreme sharpening for important features"""
         try:
-            # Step 1: Thermal calibration - identify human temperature range
-            # Typical human temperatures in thermal imagery fall in a specific range
-            # We'll enhance this range specifically to make humans stand out
+            # Step 1: Normalized contrast stretching
+            img_float = image.astype(np.float32)
+            p_low = np.percentile(img_float, 2)
+            p_high = np.percentile(img_float, 98)
             
-            # First, get overall image statistics
-            img_min = np.min(image)
-            img_max = np.max(image)
-            img_range = img_max - img_min
+            if p_high <= p_low:
+                p_high = p_low + 1
+                
+            normalized = np.clip((img_float - p_low) / (p_high - p_low), 0, 1)
+            img_8bit = (normalized * 255).astype(np.uint8)
             
-            # Analyze histogram to identify potential human regions
-            hist, bins = np.histogram(image.flatten(), 256, [img_min, img_max])
+            # Step 2: Apply wavelet denoising if available
+            if hasattr(self, 'pywt') and self.pywt is not None:
+                try:
+                    img_float = img_8bit.astype(np.float32)
+                    coeffs = self.pywt.wavedec2(img_float, 'db4', level=1)
+                    new_coeffs = [coeffs[0]]
+                    
+                    detail_coeffs = coeffs[1]
+                    sigma = np.median(np.abs(detail_coeffs[0])) / 0.6745
+                    threshold = sigma * 1.0  # Extremely gentle thresholding to preserve all details
+                    
+                    for i in range(1, len(coeffs)):
+                        coeff_details = []
+                        for j in range(len(coeffs[i])):
+                            processed = self.pywt.threshold(coeffs[i][j], threshold, mode='soft')
+                            coeff_details.append(processed)
+                        
+                        new_coeffs.append(tuple(coeff_details))
+                    
+                    denoised = self.pywt.waverec2(new_coeffs, 'db4')
+                    
+                    if denoised.shape != img_float.shape:
+                        denoised = cv2.resize(denoised, (img_float.shape[1], img_float.shape[0]))
+                    
+                    denoised = np.clip(denoised, 0, 255).astype(np.uint8)
+                    working_img = denoised
+                    
+                except Exception as e:
+                    self.get_logger().error(f"Error in wavelet denoising: {str(e)}")
+                    working_img = img_8bit
+            else:
+                working_img = img_8bit
             
-            # Human body typically appears as warmer regions (higher values)
-            # in thermal imaging, often in the upper 30-40% of the range
-            # Let's identify this region and enhance it
+            # Step 3: Create a more sophisticated feature detector
+            # This will identify important features regardless of temperature
             
-            # Find the temperature threshold that might represent human body
-            # This is typically in the upper temperature range but not at the very top
-            human_temp_lower = img_min + img_range * 0.6  # Approximate lower bound for human temps
-            human_temp_upper = img_min + img_range * 0.9  # Approximate upper bound for human temps
+            # Apply Sobel filters for gradient calculation
+            sobelx = cv2.Sobel(working_img, cv2.CV_64F, 1, 0, ksize=3)
+            sobely = cv2.Sobel(working_img, cv2.CV_64F, 0, 1, ksize=3)
+            magnitude = np.sqrt(sobelx**2 + sobely**2)
             
-            # Create a custom grayscale mapping function that:
-            # 1. Preserves overall scene context with basic contrast
-            # 2. Gives the human temperature range maximum contrast
+            # Normalize gradient magnitude
+            magnitude = cv2.normalize(magnitude, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
             
-            # Create output image with basic contrast stretching first
-            output = np.zeros_like(image, dtype=np.uint8)
+            # Identify strong gradients (important features/edges)
+            _, strong_edges = cv2.threshold(magnitude, 30, 255, cv2.THRESH_BINARY)
             
-            # Basic contrast stretch to use full 0-255 range
-            # but reserve the 100-220 range for human temperatures to create distinction
-            mask_below_human = image < human_temp_lower
-            mask_human = (image >= human_temp_lower) & (image <= human_temp_upper)
-            mask_above_human = image > human_temp_upper
+            # Apply morphological operations to connect nearby edges
+            kernel = np.ones((3, 3), np.uint8)
+            connected_edges = cv2.morphologyEx(strong_edges, cv2.MORPH_CLOSE, kernel)
             
-            # Map temperatures below human range to 0-100
-            if np.any(mask_below_human):
-                below_min = np.min(image[mask_below_human])
-                below_max = human_temp_lower
-                if below_max > below_min:
-                    output[mask_below_human] = ((image[mask_below_human] - below_min) * 100.0 / 
-                                               (below_max - below_min)).astype(np.uint8)
+            # Dilate to include areas around important features
+            feature_mask = cv2.dilate(connected_edges, kernel, iterations=1) > 0
             
-            # Map human temperature range to 100-220 (distinct middle gray)
-            # This creates maximum contrast with background
-            if np.any(mask_human):
-                human_min = human_temp_lower
-                human_max = human_temp_upper
-                if human_max > human_min:
-                    output[mask_human] = 100 + ((image[mask_human] - human_min) * 120.0 / 
-                                               (human_max - human_min)).astype(np.uint8)
+            # Step 4: Color-map inspired multi-zone processing
+            # This simulates how thermal colormaps enhance different temperature zones
             
-            # Map temperatures above human range to 220-255
-            if np.any(mask_above_human):
-                above_min = human_temp_upper
-                above_max = np.max(image[mask_above_human])
-                if above_max > above_min:
-                    output[mask_above_human] = 220 + ((image[mask_above_human] - above_min) * 35.0 / 
-                                                     (above_max - above_min)).astype(np.uint8)
+            # Create multiple intensity zones (inspired by color-map bands)
+            zones = {
+                'very_cold': working_img < 50,
+                'cold': (working_img >= 50) & (working_img < 100),
+                'neutral': (working_img >= 100) & (working_img < 150),
+                'warm': (working_img >= 150) & (working_img < 200),
+                'hot': working_img >= 200
+            }
             
-            # Apply gentle edge enhancement
-            kernel_sharpen = np.array([[-0.5, -0.5, -0.5],
-                                       [-0.5,  5.0, -0.5],
-                                       [-0.5, -0.5, -0.5]])
+            # Create zone-optimized versions
+            enhanced_img = np.zeros_like(working_img)
             
-            sharpened = cv2.filter2D(output, -1, kernel_sharpen)
+            # Apply CLAHE to each zone with optimized parameters
+            clahe_strong = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(4, 4))  # Strong for features
+            clahe_medium = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(6, 6))  # Medium for most areas
+            clahe_gentle = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))  # Gentle for hot areas
             
-            # Apply a conservative noise reduction
-            # Bilateral filter preserves edges while reducing noise
-            final_img = cv2.bilateralFilter(sharpened, 5, 25, 5)
+            # Apply zone-specific processing to simulate color-map effect
+            for zone_name, zone_mask in zones.items():
+                if np.any(zone_mask):
+                    zone_img = np.zeros_like(working_img)
+                    zone_img[zone_mask] = working_img[zone_mask]
+                    
+                    # Apply different CLAHE based on zone
+                    if zone_name in ['very_cold', 'cold']:
+                        # Cold areas - strong enhancement to reveal details
+                        processed = clahe_strong.apply(zone_img)
+                    elif zone_name == 'neutral':
+                        # Neutral areas - medium enhancement
+                        processed = clahe_medium.apply(zone_img)
+                    else:
+                        # Hot areas - gentle enhancement to preserve detail
+                        processed = clahe_gentle.apply(zone_img)
+                    
+                    # Only copy non-zero values
+                    mask = processed > 0
+                    enhanced_img[mask] = processed[mask]
             
-            return final_img
+            # Step 5: Extreme detail enhancement for important features
+            # Create multi-scale decomposition
+            gaussian = cv2.GaussianBlur(enhanced_img, (0, 0), 3)
+            detail = cv2.subtract(enhanced_img, gaussian)
+            
+            # Apply extreme enhancement to important features
+            detail_enhanced = np.copy(detail)
+            
+            # Super-strong enhancement for important features (regardless of temperature)
+            detail_enhanced[feature_mask] = cv2.multiply(detail[feature_mask], 3.5)
+            
+            # Regular enhancement for other areas
+            detail_enhanced[~feature_mask] = cv2.multiply(detail[~feature_mask], 1.5)
+            
+            # Recombine
+            recombined = cv2.add(gaussian, detail_enhanced.astype(np.uint8))
+            
+            # Step 6: Final extreme sharpening for important features
+            blur = cv2.GaussianBlur(recombined, (0, 0), 2)
+            
+            # Create extreme sharpening mask - combine feature mask with edge detection
+            edges = cv2.Canny(recombined, 50, 150)
+            edges_dilated = cv2.dilate(edges, kernel, iterations=1)
+            extreme_mask = np.logical_or(feature_mask, edges_dilated > 0)
+            
+            # Create final image
+            final_img = np.copy(recombined)
+            
+            # Apply extreme unsharp masking to important features
+            final_img[extreme_mask] = cv2.addWeighted(
+                recombined[extreme_mask], 1 + 2.5,  # Extreme sharpening amount
+                blur[extreme_mask], -2.5, 0
+            )
+            
+            # Apply moderate unsharp masking to other areas
+            final_img[~extreme_mask] = cv2.addWeighted(
+                recombined[~extreme_mask], 1 + 0.8,
+                blur[~extreme_mask], -0.8, 0
+            )
+            
+            # Final very mild denoise to clean up any introduced noise
+            # But avoid smoothing the enhanced features
+            weight_map = np.ones_like(final_img, dtype=np.float32)
+            weight_map[extreme_mask] = 0.2  # Apply minimal filtering to important features
+            weight_map[~extreme_mask] = 0.8  # Apply more filtering to other areas
+            
+            # Bilateral filter with very small diameter
+            filtered = cv2.bilateralFilter(final_img, d=3, sigmaColor=15, sigmaSpace=5)
+            
+            # Weighted combination of filtered and unfiltered
+            result = cv2.addWeighted(
+                final_img, 1.0 - weight_map,
+                filtered, weight_map, 0
+            )
+            
+            return result.astype(np.uint8)
             
         except Exception as e:
             self.get_logger().error(f"Error in image processing: {str(e)}")
