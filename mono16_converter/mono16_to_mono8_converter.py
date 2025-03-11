@@ -11,7 +11,24 @@ class Mono16ToMono8Converter(Node):
         self.get_logger().info('Starting Enhanced Mono16 to Mono8 Converter')
         
         # Try importing PyWavelets, install if not available
-        self._setup_pywavelets()
+        try:
+            import pywt
+            self.pywt = pywt
+            self.pywt_imported = True
+            self.get_logger().info("PyWavelets successfully imported")
+        except ImportError:
+            self.get_logger().info("PyWavelets not found, attempting to install...")
+            try:
+                import subprocess
+                import sys
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "pywavelets"])
+                import pywt
+                self.pywt = pywt
+                self.pywt_imported = True
+                self.get_logger().info("PyWavelets successfully installed and imported")
+            except Exception as e:
+                self.get_logger().warn(f"Could not install PyWavelets: {str(e)}. Proceeding without wavelet denoising.")
+                self.pywt_imported = False
         
         # Initialize parameters
         self.declare_parameter('clahe_clip_limit', 2.0)
@@ -23,7 +40,7 @@ class Mono16ToMono8Converter(Node):
         self.declare_parameter('input_topic', 'image_raw')
         self.declare_parameter('output_topic', 'image_raw/mono8')
         self.declare_parameter('target_fps', 10.0)
-        self.declare_parameter('target_image_encoding', 'INFERNO')  # Keeping for future use
+        self.declare_parameter('target_image_encoding', 'INFERNO')
         
         # Get parameters
         clahe_clip_limit = self.get_parameter('clahe_clip_limit').value
@@ -66,27 +83,6 @@ class Mono16ToMono8Converter(Node):
         
         # Add a debug message to verify the node is running
         self.get_logger().info('Node initialized successfully')
-    
-    def _setup_pywavelets(self):
-        """Setup PyWavelets package for wavelet-based processing"""
-        try:
-            import pywt
-            self.pywt = pywt
-            self.pywt_imported = True
-            self.get_logger().info("PyWavelets successfully imported")
-        except ImportError:
-            self.get_logger().info("PyWavelets not found, attempting to install...")
-            try:
-                import subprocess
-                import sys
-                subprocess.check_call([sys.executable, "-m", "pip", "install", "pywavelets"])
-                import pywt
-                self.pywt = pywt
-                self.pywt_imported = True
-                self.get_logger().info("PyWavelets successfully installed and imported")
-            except Exception as e:
-                self.get_logger().warn(f"Could not install PyWavelets: {str(e)}. Proceeding without wavelet denoising.")
-                self.pywt_imported = False
 
     def image_callback(self, msg):
         """Store the latest image message"""
@@ -124,215 +120,161 @@ class Mono16ToMono8Converter(Node):
             img_8bit = (normalized * 255).astype(np.uint8)
             
             # Step 2: Apply wavelet denoising if available
-            working_img = self._apply_wavelet_denoising(img_8bit)
+            if hasattr(self, 'pywt') and self.pywt is not None:
+                try:
+                    img_float = img_8bit.astype(np.float32)
+                    coeffs = self.pywt.wavedec2(img_float, 'db4', level=1)
+                    new_coeffs = [coeffs[0]]
+                    
+                    detail_coeffs = coeffs[1]
+                    sigma = np.median(np.abs(detail_coeffs[0])) / 0.6745
+                    threshold = sigma * 1.0  # Extremely gentle thresholding to preserve all details
+                    
+                    for i in range(1, len(coeffs)):
+                        coeff_details = []
+                        for j in range(len(coeffs[i])):
+                            processed = self.pywt.threshold(coeffs[i][j], threshold, mode='soft')
+                            coeff_details.append(processed)
+                        
+                        new_coeffs.append(tuple(coeff_details))
+                    
+                    denoised = self.pywt.waverec2(new_coeffs, 'db4')
+                    
+                    if denoised.shape != img_float.shape:
+                        denoised = cv2.resize(denoised, (img_float.shape[1], img_float.shape[0]))
+                    
+                    denoised = np.clip(denoised, 0, 255).astype(np.uint8)
+                    working_img = denoised
+                    
+                except Exception as e:
+                    self.get_logger().error(f"Error in wavelet denoising: {str(e)}")
+                    working_img = img_8bit
+            else:
+                working_img = img_8bit
             
-            # Step 3: Create feature mask for important details
-            feature_mask = self._create_feature_mask(working_img)
+            # Step 3: Create a more sophisticated feature detector
+            # This will identify important features regardless of temperature
             
-            # Step 4: Apply zone-based enhancement
-            enhanced_img = self._apply_zone_enhancement(working_img)
+            # Apply Sobel filters for gradient calculation
+            sobelx = cv2.Sobel(working_img, cv2.CV_64F, 1, 0, ksize=3)
+            sobely = cv2.Sobel(working_img, cv2.CV_64F, 0, 1, ksize=3)
+            magnitude = np.sqrt(sobelx**2 + sobely**2)
             
-            # Step 5: Apply multi-scale detail enhancement
-            recombined = self._enhance_details(enhanced_img, feature_mask)
+            # Normalize gradient magnitude
+            magnitude = cv2.normalize(magnitude, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
             
-            # Step 6: Final sharpening with feature preservation
-            final_img = self._apply_adaptive_sharpening(recombined, feature_mask)
+            # Identify strong gradients (important features/edges)
+            _, strong_edges = cv2.threshold(magnitude, 30, 255, cv2.THRESH_BINARY)
             
-            return final_img.astype(np.uint8)
+            # Apply morphological operations to connect nearby edges
+            kernel = np.ones((3, 3), np.uint8)
+            connected_edges = cv2.morphologyEx(strong_edges, cv2.MORPH_CLOSE, kernel)
+            
+            # Dilate to include areas around important features
+            feature_mask = cv2.dilate(connected_edges, kernel, iterations=1) > 0
+            
+            # Step 4: Color-map inspired multi-zone processing
+            # This simulates how thermal colormaps enhance different temperature zones
+            
+            # Create multiple intensity zones (inspired by color-map bands)
+            zones = {
+                'very_cold': working_img < 50,
+                'cold': (working_img >= 50) & (working_img < 100),
+                'neutral': (working_img >= 100) & (working_img < 150),
+                'warm': (working_img >= 150) & (working_img < 200),
+                'hot': working_img >= 200
+            }
+            
+            # Create zone-optimized versions
+            enhanced_img = np.zeros_like(working_img)
+            
+            # Apply CLAHE to each zone with optimized parameters
+            clahe_strong = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(4, 4))  # Strong for features
+            clahe_medium = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(6, 6))  # Medium for most areas
+            clahe_gentle = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))  # Gentle for hot areas
+            
+            # Apply zone-specific processing to simulate color-map effect
+            for zone_name, zone_mask in zones.items():
+                if np.any(zone_mask):
+                    zone_img = np.zeros_like(working_img)
+                    zone_img[zone_mask] = working_img[zone_mask]
+                    
+                    # Apply different CLAHE based on zone
+                    if zone_name in ['very_cold', 'cold']:
+                        # Cold areas - strong enhancement to reveal details
+                        processed = clahe_strong.apply(zone_img)
+                    elif zone_name == 'neutral':
+                        # Neutral areas - medium enhancement
+                        processed = clahe_medium.apply(zone_img)
+                    else:
+                        # Hot areas - gentle enhancement to preserve detail
+                        processed = clahe_gentle.apply(zone_img)
+                    
+                    # Only copy non-zero values
+                    mask = processed > 0
+                    enhanced_img[mask] = processed[mask]
+            
+            # Step 5: Extreme detail enhancement for important features
+            # Create multi-scale decomposition
+            gaussian = cv2.GaussianBlur(enhanced_img, (0, 0), 3)
+            detail = cv2.subtract(enhanced_img, gaussian)
+            
+            # Apply extreme enhancement to important features
+            detail_enhanced = np.copy(detail)
+            
+            # Super-strong enhancement for important features (regardless of temperature)
+            detail_enhanced[feature_mask] = cv2.multiply(detail[feature_mask], 3.5)
+            
+            # Regular enhancement for other areas
+            detail_enhanced[~feature_mask] = cv2.multiply(detail[~feature_mask], 1.5)
+            
+            # Recombine
+            recombined = cv2.add(gaussian, detail_enhanced.astype(np.uint8))
+            
+            # Step 6: Final extreme sharpening for important features
+            blur = cv2.GaussianBlur(recombined, (0, 0), 2)
+            
+            # Create extreme sharpening mask - combine feature mask with edge detection
+            edges = cv2.Canny(recombined, 50, 150)
+            edges_dilated = cv2.dilate(edges, kernel, iterations=1)
+            extreme_mask = np.logical_or(feature_mask, edges_dilated > 0)
+            
+            # Create final image
+            final_img = np.copy(recombined)
+            
+            # Apply extreme unsharp masking to important features
+            final_img[extreme_mask] = cv2.addWeighted(
+                recombined[extreme_mask], 1 + 2.5,  # Extreme sharpening amount
+                blur[extreme_mask], -2.5, 0
+            )
+            
+            # Apply moderate unsharp masking to other areas
+            final_img[~extreme_mask] = cv2.addWeighted(
+                recombined[~extreme_mask], 1 + 0.8,
+                blur[~extreme_mask], -0.8, 0
+            )
+            
+            # Final very mild denoise to clean up any introduced noise
+            # But avoid smoothing the enhanced features
+            weight_map = np.ones_like(final_img, dtype=np.float32)
+            weight_map[extreme_mask] = 0.2  # Apply minimal filtering to important features
+            weight_map[~extreme_mask] = 0.8  # Apply more filtering to other areas
+            
+            # Bilateral filter with very small diameter
+            filtered = cv2.bilateralFilter(final_img, d=3, sigmaColor=15, sigmaSpace=5)
+            
+            # Weighted combination of filtered and unfiltered
+            result = cv2.addWeighted(
+                final_img, 1.0 - weight_map,
+                filtered, weight_map, 0
+            )
+            
+            return result.astype(np.uint8)
             
         except Exception as e:
             self.get_logger().error(f"Error in image processing: {str(e)}")
             # Fallback to basic normalization
-            return self._normalize_to_uint8(image)
-    
-    def _normalize_to_uint8(self, image):
-        """Efficiently convert to 8-bit with full dynamic range"""
-        img_min = image.min()
-        img_max = image.max()
-        if img_max == img_min:
-            return np.zeros(image.shape, dtype=np.uint8)
-        return ((image - img_min) * 255.0 / (img_max - img_min)).astype(np.uint8)
-    
-    def _apply_wavelet_denoising(self, img_8bit):
-        """Apply wavelet denoising if PyWavelets is available"""
-        if not hasattr(self, 'pywt_imported') or not self.pywt_imported:
-            return img_8bit
-            
-        try:
-            img_float = img_8bit.astype(np.float32)
-            coeffs = self.pywt.wavedec2(img_float, 'db4', level=1)
-            new_coeffs = [coeffs[0]]
-            
-            detail_coeffs = coeffs[1]
-            sigma = np.median(np.abs(detail_coeffs[0])) / 0.6745
-            threshold = sigma * 1.0  # Extremely gentle thresholding to preserve all details
-            
-            for i in range(1, len(coeffs)):
-                coeff_details = []
-                for j in range(len(coeffs[i])):
-                    processed = self.pywt.threshold(coeffs[i][j], threshold, mode='soft')
-                    coeff_details.append(processed)
-                
-                new_coeffs.append(tuple(coeff_details))
-            
-            denoised = self.pywt.waverec2(new_coeffs, 'db4')
-            
-            if denoised.shape != img_float.shape:
-                denoised = cv2.resize(denoised, (img_float.shape[1], img_float.shape[0]))
-            
-            return np.clip(denoised, 0, 255).astype(np.uint8)
-            
-        except Exception as e:
-            self.get_logger().error(f"Error in wavelet denoising: {str(e)}")
-            return img_8bit
-    
-    def _create_feature_mask(self, image):
-        """Create a mask highlighting important thermal features"""
-        # Apply Sobel filters for gradient calculation
-        sobelx = cv2.Sobel(image, cv2.CV_64F, 1, 0, ksize=3)
-        sobely = cv2.Sobel(image, cv2.CV_64F, 0, 1, ksize=3)
-        magnitude = np.sqrt(sobelx**2 + sobely**2)
-        
-        # Normalize gradient magnitude
-        magnitude = cv2.normalize(magnitude, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        
-        # Identify strong gradients (important features/edges)
-        _, strong_edges = cv2.threshold(magnitude, 30, 255, cv2.THRESH_BINARY)
-        
-        # Apply morphological operations to connect nearby edges
-        kernel = np.ones((3, 3), np.uint8)
-        connected_edges = cv2.morphologyEx(strong_edges, cv2.MORPH_CLOSE, kernel)
-        
-        # Dilate to include areas around important features
-        return cv2.dilate(connected_edges, kernel, iterations=1) > 0
-    
-    def _apply_zone_enhancement(self, image):
-        """Apply zone-based enhancement to simulate thermal colormap effects"""
-        # Create multiple intensity zones (inspired by color-map bands)
-        zones = {
-            'very_cold': image < 50,
-            'cold': (image >= 50) & (image < 100),
-            'neutral': (image >= 100) & (image < 150),
-            'warm': (image >= 150) & (image < 200),
-            'hot': image >= 200
-        }
-        
-        # Create zone-optimized versions
-        enhanced_img = np.zeros_like(image)
-        
-        # Create CLAHE objects with different parameters
-        clahe_settings = {
-            'strong': cv2.createCLAHE(clipLimit=4.0, tileGridSize=(4, 4)),
-            'medium': cv2.createCLAHE(clipLimit=3.0, tileGridSize=(6, 6)),
-            'gentle': cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        }
-        
-        # Map zones to CLAHE strength
-        zone_clahe_map = {
-            'very_cold': 'strong',
-            'cold': 'strong',
-            'neutral': 'medium',
-            'warm': 'gentle',
-            'hot': 'gentle'
-        }
-        
-        # Apply zone-specific processing
-        for zone_name, zone_mask in zones.items():
-            if np.any(zone_mask):
-                zone_img = np.zeros_like(image)
-                zone_img[zone_mask] = image[zone_mask]
-                
-                # Get appropriate CLAHE strength for this zone
-                clahe_type = zone_clahe_map[zone_name]
-                processed = clahe_settings[clahe_type].apply(zone_img)
-                
-                # Only copy non-zero values
-                mask = processed > 0
-                enhanced_img[mask] = processed[mask]
-        
-        return enhanced_img
-    
-    def _enhance_details(self, image, feature_mask):
-        """Apply multi-scale decomposition for detail enhancement"""
-        # Create multi-scale decomposition
-        gaussian = cv2.GaussianBlur(image, (0, 0), 3)
-        detail = cv2.subtract(image, gaussian)
-        
-        # Convert boolean mask to uint8 for OpenCV operations
-        feature_mask_uint8 = feature_mask.astype(np.uint8) * 255
-        non_feature_mask = cv2.bitwise_not(feature_mask_uint8)
-        
-        # Strong enhancement for features
-        detail_features = cv2.bitwise_and(detail, detail, mask=feature_mask_uint8)
-        enhanced_features = cv2.multiply(detail_features, 3.5)
-        
-        # Moderate enhancement for non-features
-        detail_non_features = cv2.bitwise_and(detail, detail, mask=non_feature_mask)
-        enhanced_non_features = cv2.multiply(detail_non_features, 1.5)
-        
-        # Combine enhanced details
-        enhanced_detail = cv2.add(enhanced_features, enhanced_non_features)
-        
-        # Recombine with gaussian component
-        return cv2.add(gaussian, enhanced_detail)
-
-    
-    def _apply_adaptive_sharpening(self, image, feature_mask):
-        """Apply adaptive sharpening based on feature importance"""
-        # Create blurred version for unsharp masking
-        blur = cv2.GaussianBlur(image, (0, 0), 2)
-        
-        # Create edge detection mask and combine with feature mask
-        edges = cv2.Canny(image, 50, 150)
-        kernel = np.ones((3, 3), np.uint8)
-        edges_dilated = cv2.dilate(edges, kernel, iterations=1)
-        
-        # Convert feature mask to uint8 and combine with edges
-        feature_mask_uint8 = feature_mask.astype(np.uint8) * 255
-        combined_mask = cv2.bitwise_or(feature_mask_uint8, edges_dilated)
-        non_feature_mask = cv2.bitwise_not(combined_mask)
-        
-        # Apply extreme sharpening to feature areas
-        feature_img = cv2.bitwise_and(image, image, mask=combined_mask)
-        feature_blur = cv2.bitwise_and(blur, blur, mask=combined_mask)
-        
-        enhanced_features = cv2.addWeighted(
-            feature_img, 3.5,  # Strong enhancement 
-            feature_blur, -2.5, 0
-        )
-        
-        # Apply moderate sharpening to non-feature areas
-        non_feature_img = cv2.bitwise_and(image, image, mask=non_feature_mask)
-        non_feature_blur = cv2.bitwise_and(blur, blur, mask=non_feature_mask)
-        
-        enhanced_non_features = cv2.addWeighted(
-            non_feature_img, 1.8,  # Moderate enhancement
-            non_feature_blur, -0.8, 0
-        )
-        
-        # Combine enhanced regions
-        sharpened = cv2.add(enhanced_features, enhanced_non_features)
-        
-        # Apply adaptive bilateral filtering
-        # Convert masks to floating point weight maps for weighted blending
-        feature_weight = combined_mask.astype(np.float32) / 255.0
-        
-        # Apply bilateral filter to the entire image
-        filtered = cv2.bilateralFilter(sharpened, d=3, sigmaColor=15, sigmaSpace=5)
-        
-        # Calculate weighted combination
-        # Features: 20% filtered, 80% unfiltered
-        # Non-features: 80% filtered, 20% unfiltered
-        weight_map = np.ones_like(feature_weight) * 0.8
-        weight_map = weight_map * (1 - feature_weight) + 0.2 * feature_weight
-        
-        # Apply weighted blending using addWeighted
-        result = cv2.addWeighted(
-            sharpened, 1.0 - weight_map.mean(),  # Use mean weight for simplicity
-            filtered, weight_map.mean(), 0
-        )
-        
-        return result
+            return self.normalize_to_uint8(image)
 
     def process_and_publish(self):
         """Process and publish the latest image at the timer rate"""
@@ -364,4 +306,3 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
-
