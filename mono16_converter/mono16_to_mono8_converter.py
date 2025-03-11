@@ -258,56 +258,81 @@ class Mono16ToMono8Converter(Node):
         gaussian = cv2.GaussianBlur(image, (0, 0), 3)
         detail = cv2.subtract(image, gaussian)
         
-        # Apply extreme enhancement to important features
-        detail_enhanced = np.copy(detail)
+        # Convert boolean mask to uint8 for OpenCV operations
+        feature_mask_uint8 = feature_mask.astype(np.uint8) * 255
+        non_feature_mask = cv2.bitwise_not(feature_mask_uint8)
         
-        # Super-strong enhancement for important features
-        detail_enhanced[feature_mask] = cv2.multiply(detail[feature_mask], 3.5)
+        # Strong enhancement for features
+        detail_features = cv2.bitwise_and(detail, detail, mask=feature_mask_uint8)
+        enhanced_features = cv2.multiply(detail_features, 3.5)
         
-        # Regular enhancement for other areas
-        detail_enhanced[~feature_mask] = cv2.multiply(detail[~feature_mask], 1.5)
+        # Moderate enhancement for non-features
+        detail_non_features = cv2.bitwise_and(detail, detail, mask=non_feature_mask)
+        enhanced_non_features = cv2.multiply(detail_non_features, 1.5)
         
-        # Recombine
-        return cv2.add(gaussian, detail_enhanced.astype(np.uint8))
+        # Combine enhanced details
+        enhanced_detail = cv2.add(enhanced_features, enhanced_non_features)
+        
+        # Recombine with gaussian component
+        return cv2.add(gaussian, enhanced_detail)
+
     
     def _apply_adaptive_sharpening(self, image, feature_mask):
         """Apply adaptive sharpening based on feature importance"""
+        # Create blurred version for unsharp masking
         blur = cv2.GaussianBlur(image, (0, 0), 2)
         
-        # Create extreme sharpening mask - combine feature mask with edge detection
+        # Create edge detection mask and combine with feature mask
         edges = cv2.Canny(image, 50, 150)
         kernel = np.ones((3, 3), np.uint8)
         edges_dilated = cv2.dilate(edges, kernel, iterations=1)
-        extreme_mask = np.logical_or(feature_mask, edges_dilated > 0)
         
-        # Create final image
-        final_img = np.copy(image)
+        # Convert feature mask to uint8 and combine with edges
+        feature_mask_uint8 = feature_mask.astype(np.uint8) * 255
+        combined_mask = cv2.bitwise_or(feature_mask_uint8, edges_dilated)
+        non_feature_mask = cv2.bitwise_not(combined_mask)
         
-        # Apply extreme unsharp masking to important features
-        final_img[extreme_mask] = cv2.addWeighted(
-            image[extreme_mask], 1 + 2.5,  # Extreme sharpening amount
-            blur[extreme_mask], -2.5, 0
+        # Apply extreme sharpening to feature areas
+        feature_img = cv2.bitwise_and(image, image, mask=combined_mask)
+        feature_blur = cv2.bitwise_and(blur, blur, mask=combined_mask)
+        
+        enhanced_features = cv2.addWeighted(
+            feature_img, 3.5,  # Strong enhancement 
+            feature_blur, -2.5, 0
         )
         
-        # Apply moderate unsharp masking to other areas
-        final_img[~extreme_mask] = cv2.addWeighted(
-            image[~extreme_mask], 1 + 0.8,
-            blur[~extreme_mask], -0.8, 0
+        # Apply moderate sharpening to non-feature areas
+        non_feature_img = cv2.bitwise_and(image, image, mask=non_feature_mask)
+        non_feature_blur = cv2.bitwise_and(blur, blur, mask=non_feature_mask)
+        
+        enhanced_non_features = cv2.addWeighted(
+            non_feature_img, 1.8,  # Moderate enhancement
+            non_feature_blur, -0.8, 0
         )
         
-        # Final adaptive denoising
-        weight_map = np.ones_like(final_img, dtype=np.float32)
-        weight_map[extreme_mask] = 0.2  # Apply minimal filtering to important features
-        weight_map[~extreme_mask] = 0.8  # Apply more filtering to other areas
+        # Combine enhanced regions
+        sharpened = cv2.add(enhanced_features, enhanced_non_features)
         
-        # Bilateral filter with very small diameter
-        filtered = cv2.bilateralFilter(final_img, d=3, sigmaColor=15, sigmaSpace=5)
+        # Apply adaptive bilateral filtering
+        # Convert masks to floating point weight maps for weighted blending
+        feature_weight = combined_mask.astype(np.float32) / 255.0
         
-        # Weighted combination of filtered and unfiltered
-        return cv2.addWeighted(
-            final_img, 1.0 - weight_map,
-            filtered, weight_map, 0
+        # Apply bilateral filter to the entire image
+        filtered = cv2.bilateralFilter(sharpened, d=3, sigmaColor=15, sigmaSpace=5)
+        
+        # Calculate weighted combination
+        # Features: 20% filtered, 80% unfiltered
+        # Non-features: 80% filtered, 20% unfiltered
+        weight_map = np.ones_like(feature_weight) * 0.8
+        weight_map = weight_map * (1 - feature_weight) + 0.2 * feature_weight
+        
+        # Apply weighted blending using addWeighted
+        result = cv2.addWeighted(
+            sharpened, 1.0 - weight_map.mean(),  # Use mean weight for simplicity
+            filtered, weight_map.mean(), 0
         )
+        
+        return result
 
     def process_and_publish(self):
         """Process and publish the latest image at the timer rate"""
