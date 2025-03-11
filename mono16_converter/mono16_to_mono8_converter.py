@@ -153,8 +153,6 @@ class Mono16ToMono8Converter(Node):
                 working_img = img_8bit
             
             # Step 3: Create a more sophisticated feature detector
-            # This will identify important features regardless of temperature
-            
             # Apply Sobel filters for gradient calculation
             sobelx = cv2.Sobel(working_img, cv2.CV_64F, 1, 0, ksize=3)
             sobely = cv2.Sobel(working_img, cv2.CV_64F, 0, 1, ksize=3)
@@ -174,8 +172,6 @@ class Mono16ToMono8Converter(Node):
             feature_mask = cv2.dilate(connected_edges, kernel, iterations=1) > 0
             
             # Step 4: Color-map inspired multi-zone processing
-            # This simulates how thermal colormaps enhance different temperature zones
-            
             # Create multiple intensity zones (inspired by color-map bands)
             zones = {
                 'very_cold': working_img < 50,
@@ -219,17 +215,19 @@ class Mono16ToMono8Converter(Node):
             gaussian = cv2.GaussianBlur(enhanced_img, (0, 0), 3)
             detail = cv2.subtract(enhanced_img, gaussian)
             
-            # Apply extreme enhancement to important features
+            # Apply extreme enhancement to important features - Method 4 from our test
             detail_enhanced = np.copy(detail)
             
-            # Super-strong enhancement for important features (regardless of temperature)
-            detail_enhanced[feature_mask] = cv2.multiply(detail[feature_mask], 3.5)
+            # Method 4: Pre-compute enhanced versions
+            strong_detail = cv2.multiply(detail.astype(np.float32), 3.5).astype(np.uint8)
+            mild_detail = cv2.multiply(detail.astype(np.float32), 1.5).astype(np.uint8)
             
-            # Regular enhancement for other areas
-            detail_enhanced[~feature_mask] = cv2.multiply(detail[~feature_mask], 1.5)
+            # Apply the appropriate enhancement using the mask
+            detail_enhanced[feature_mask] = strong_detail[feature_mask]
+            detail_enhanced[~feature_mask] = mild_detail[~feature_mask]
             
             # Recombine
-            recombined = cv2.add(gaussian, detail_enhanced.astype(np.uint8))
+            recombined = cv2.add(gaussian, detail_enhanced)
             
             # Step 6: Final extreme sharpening for important features
             blur = cv2.GaussianBlur(recombined, (0, 0), 2)
@@ -242,17 +240,13 @@ class Mono16ToMono8Converter(Node):
             # Create final image
             final_img = np.copy(recombined)
             
-            # Apply extreme unsharp masking to important features
-            final_img[extreme_mask] = cv2.addWeighted(
-                recombined[extreme_mask], 1 + 2.5,  # Extreme sharpening amount
-                blur[extreme_mask], -2.5, 0
-            )
+            # Method 4: Pre-compute sharpened versions
+            extreme_sharp = cv2.addWeighted(recombined, 1 + 2.5, blur, -2.5, 0)
+            moderate_sharp = cv2.addWeighted(recombined, 1 + 0.8, blur, -0.8, 0)
             
-            # Apply moderate unsharp masking to other areas
-            final_img[~extreme_mask] = cv2.addWeighted(
-                recombined[~extreme_mask], 1 + 0.8,
-                blur[~extreme_mask], -0.8, 0
-            )
+            # Apply the appropriate sharpening using the mask
+            final_img[extreme_mask] = extreme_sharp[extreme_mask]
+            final_img[~extreme_mask] = moderate_sharp[~extreme_mask]
             
             # Final very mild denoise to clean up any introduced noise
             # But avoid smoothing the enhanced features
@@ -263,13 +257,12 @@ class Mono16ToMono8Converter(Node):
             # Bilateral filter with very small diameter
             filtered = cv2.bilateralFilter(final_img, d=3, sigmaColor=15, sigmaSpace=5)
             
-            # Weighted combination of filtered and unfiltered
-            result = cv2.addWeighted(
-                final_img, 1.0 - weight_map,
-                filtered, weight_map, 0
-            )
+            # For the final weighted blend, we need a different approach
+            inv_weight_map = 1.0 - weight_map
+            result = (final_img.astype(np.float32) * inv_weight_map + 
+                    filtered.astype(np.float32) * weight_map).astype(np.uint8)
             
-            return result.astype(np.uint8)
+            return result
             
         except Exception as e:
             self.get_logger().error(f"Error in image processing: {str(e)}")
